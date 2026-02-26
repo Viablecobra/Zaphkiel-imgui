@@ -272,7 +272,9 @@ static std::mutex g_boundsMutex;
 
 
 
-void DrawMenu() {
+
+
+void drawmenu() {
     static bool show_menu = false;
     static bool motion_blur_enabled = true;
     static int current_tab = 0;
@@ -331,7 +333,7 @@ void DrawMenu() {
             
             if (i == 0) {
                 draw_list->AddCircleFilled(ImVec2(center.x, center.y - 4), 6.0f, icon_color);
-                draw_list->AddPathArcTo(center, 12.0f, 0.0f, 3.14159f);
+                draw_list->PathArcTo(center, 12.0f, 0.0f, 3.14159f);
                 draw_list->PathStroke(icon_color, false, 3.0f);
             } else if (i == 1) {
                 draw_list->AddRectFilled(ImVec2(center.x - 6, center.y - 6), ImVec2(center.x + 6, center.y + 6), icon_color);
