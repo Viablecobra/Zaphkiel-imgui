@@ -8,6 +8,8 @@
 #include <dlfcn.h>
 #include <string.h>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -15,47 +17,73 @@
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
-
-// Zaphkiel bridge — resolved at runtime via dlsym, no link-time dependency
-extern "C" void zaphkiel_draw_tab();
-extern "C" bool zaphkiel_notify_touch(int action, float x, float y);
-
-// ── state ─────────────────────────────────────────────────────────────────────
+#include "zaphkiel_bridge.h"
 
 static bool       g_initialized   = false;
 static int        g_width         = 0;
 static int        g_height        = 0;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
-
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 struct WindowBounds { float x, y, w, h; bool visible; };
 static WindowBounds g_menuBounds = {0, 0, 0, 0, false};
 static std::mutex   g_boundsMutex;
 
-// ── drawmenu ──────────────────────────────────────────────────────────────────
+struct SearchResult { std::string file; int line; std::string text; };
+static std::vector<SearchResult> g_search_results;
+static char   g_search_buf[256] = {};
+static std::mutex g_search_mutex;
+
+static void do_search(const char* query) {
+    std::vector<SearchResult> results;
+    const char* files[] = {
+        "functions.txt","imports.txt","exports.txt","vtables.txt",
+        "rtti.txt","names.txt","strings.txt","xrefs.txt",
+        "pseudo_c.txt","structs.txt","patterns.txt","relocs.txt",
+    };
+    std::string q = query;
+    for (auto& c : q) c = tolower(c);
+    for (auto& fname : files) {
+        std::string path = std::string("/storage/emulated/0/games/kurumi/") + fname;
+        FILE* f = fopen(path.c_str(), "r");
+        if (!f) continue;
+        char line[512];
+        int lineno = 0;
+        while (fgets(line, sizeof(line), f)) {
+            lineno++;
+            std::string l = line;
+            std::string ll = l;
+            for (auto& c : ll) c = tolower(c);
+            if (ll.find(q) != std::string::npos) {
+                if (l.size() > 100) l.resize(100);
+                results.push_back({fname, lineno, l});
+                if (results.size() >= 200) { fclose(f); goto done; }
+            }
+        }
+        fclose(f);
+    }
+    done:
+    std::lock_guard<std::mutex> lock(g_search_mutex);
+    g_search_results = results;
+}
 
 void drawmenu() {
-    static bool show_menu  = false;
+    static bool show_menu   = false;
     static int  current_tab = 0;
 
     ImGuiIO& io = ImGui::GetIO();
 
-    // ── floating open button (left-center edge) ───────────────────────────────
     ImGui::SetNextWindowPos(
         ImVec2(0.0f, io.DisplaySize.y * 0.5f),
-        ImGuiCond_Always,
-        ImVec2(0.0f, 0.5f)
-    );
+        ImGuiCond_Always, ImVec2(0.0f, 0.5f));
     ImGui::Begin("MenuTrigger", nullptr,
         ImGuiWindowFlags_NoDecoration     |
         ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoBackground);
-
     ImGui::SetWindowFontScale(1.5f);
-    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.1f, 0.1f, 0.1f, 0.8f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.1f,0.1f,0.1f,0.8f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f,0.2f,0.2f,1.0f));
     if (ImGui::Button("OPEN MENU", ImVec2(200, 80)))
         show_menu = !show_menu;
     ImGui::PopStyleColor(2);
@@ -64,28 +92,21 @@ void drawmenu() {
 
     if (!show_menu) return;
 
-    // ── main window ───────────────────────────────────────────────────────────
-    ImGui::SetNextWindowSize(
-        ImVec2(1000, 650),
-        ImGuiCond_Appearing
-    );
+    ImGui::SetNextWindowSize(ImVec2(1000, 650), ImGuiCond_Appearing);
     ImGui::SetNextWindowPos(
         ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
-        ImGuiCond_Appearing,
-        ImVec2(0.5f, 0.5f)
-    );
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(0, 0));
+        ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,    ImVec2(0,0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.06f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f,0.06f,0.06f,1.0f));
 
-    ImGui::Begin("CustomUI_Main", &show_menu,
+    ImGui::Begin("Zaphkiel", &show_menu,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse);
 
     ImVec2      win_pos  = ImGui::GetWindowPos();
     ImVec2      win_size = ImGui::GetWindowSize();
     ImDrawList* dl       = ImGui::GetWindowDrawList();
 
-    // rainbow top bar
     float t = (float)ImGui::GetTime();
     float r, g, b;
     ImGui::ColorConvertHSVtoRGB(fmodf(t * 0.5f, 1.0f), 1.0f, 1.0f, r, g, b);
@@ -95,12 +116,10 @@ void drawmenu() {
 
     ImGui::SetCursorPosY(5.0f);
 
-    // ── sidebar tabs ─────────────────────────────────────────────────────────
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.04f, 0.04f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f,0.04f,0.04f,1.0f));
     ImGui::BeginChild("Sidebar", ImVec2(120, win_size.y - 5.0f), false);
 
-    // 4 tabs: 0=Home 1=Box 2=X 3=Zaphkiel(sliders icon)
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 3; ++i) {
         ImVec2 cp     = ImGui::GetCursorScreenPos();
         ImVec2 center = ImVec2(cp.x + 60.0f, cp.y + 60.0f);
 
@@ -114,94 +133,132 @@ void drawmenu() {
                 ImVec2(120.0f, 120.0f)))
             current_tab = i;
 
-        ImU32 col  = (current_tab == i) ? ImColor(255,255,255) : ImColor(150,150,150);
-        float stk  = 4.0f;
+        ImU32 col = (current_tab == i) ? ImColor(255,255,255) : ImColor(150,150,150);
+        float stk = 4.0f;
 
         if (i == 0) {
-            // person icon
-            dl->AddCircleFilled(ImVec2(center.x, center.y - 8), 12.0f, col);
-            dl->PathArcTo(center, 22.0f, 0.0f, 3.14159f);
-            dl->PathStroke(col, false, stk);
+            dl->AddCircle(ImVec2(center.x - 4, center.y - 4), 14.0f, col, 0, stk);
+            dl->AddLine(ImVec2(center.x + 6,  center.y + 6),
+                        ImVec2(center.x + 18, center.y + 18), col, stk);
         } else if (i == 1) {
-            // box icon
-            dl->AddRectFilled(ImVec2(center.x-12,center.y-12),ImVec2(center.x+12,center.y+12),col);
-            dl->AddRect(ImVec2(center.x-20,center.y-20),ImVec2(center.x+20,center.y+20),col,0,0,stk);
-        } else if (i == 2) {
-            // X icon
-            dl->AddLine(ImVec2(center.x-20,center.y-20),ImVec2(center.x+20,center.y+20),col,stk+1);
-            dl->AddLine(ImVec2(center.x+20,center.y-20),ImVec2(center.x-20,center.y+20),col,stk+1);
+            dl->AddRectFilled(ImVec2(center.x-18,center.y-14),ImVec2(center.x+18,center.y-6), col);
+            dl->AddRectFilled(ImVec2(center.x-18,center.y-2), ImVec2(center.x+8, center.y+6), col);
+            dl->AddRectFilled(ImVec2(center.x-18,center.y+10),ImVec2(center.x+14,center.y+18),col);
         } else {
-            // sliders icon (Zaphkiel)
-            dl->AddLine(ImVec2(center.x-20,center.y-10),ImVec2(center.x+20,center.y-10),col,stk);
-            dl->AddCircleFilled(ImVec2(center.x-5, center.y-10),6.0f,col);
-            dl->AddLine(ImVec2(center.x-20,center.y+10),ImVec2(center.x+20,center.y+10),col,stk);
-            dl->AddCircleFilled(ImVec2(center.x+8, center.y+10),6.0f,col);
+            dl->AddCircle(center, 14.0f, col, 0, stk);
+            dl->AddCircleFilled(center, 5.0f, col);
         }
     }
     ImGui::EndChild();
-    ImGui::PopStyleColor(); // ChildBg
+    ImGui::PopStyleColor();
 
     ImGui::SameLine(0, 0);
 
-    // ── content area ─────────────────────────────────────────────────────────
     ImGui::BeginChild("Content", ImVec2(win_size.x - 120.0f, win_size.y - 5.0f), false);
-    ImGui::SetCursorPos(ImVec2(40.0f, 40.0f));
+    ImGui::SetCursorPos(ImVec2(20.0f, 20.0f));
 
     if (current_tab == 0) {
-        // ── Tab 0: placeholder (was motion blur, now empty for your use) ──────
-        ImGui::SetWindowFontScale(1.8f);
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Tab 0 — add your features here");
+        ImGui::SetWindowFontScale(1.4f);
+        ImGui::TextColored(ImVec4(0.4f,0.9f,0.6f,1.0f), "Search Dumps");
         ImGui::SetWindowFontScale(1.0f);
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::SetNextItemWidth(500.0f);
+        bool enter = ImGui::InputText("##q", g_search_buf, sizeof(g_search_buf),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        bool btn = ImGui::Button("Search", ImVec2(120, 0));
+
+        if ((enter || btn) && strlen(g_search_buf) >= 2) {
+            std::string q = g_search_buf;
+            pthread_t pt;
+            pthread_create(&pt, nullptr, [](void* arg) -> void* {
+                std::string* q = (std::string*)arg;
+                do_search(q->c_str());
+                delete q;
+                return nullptr;
+            }, new std::string(q));
+            pthread_detach(pt);
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        {
+            std::lock_guard<std::mutex> lock(g_search_mutex);
+            if (g_search_results.empty()) {
+                ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.0f),
+                    strlen(g_search_buf) < 2
+                        ? "Type at least 2 characters and press Search"
+                        : "No results");
+            } else {
+                ImGui::Text("%zu results:", g_search_results.size());
+                ImGui::BeginChild("##results", ImVec2(0, 0), false);
+                for (auto& res : g_search_results) {
+                    ImGui::TextColored(ImVec4(0.4f,0.7f,1.0f,1.0f),
+                        "[%s:%d]", res.file.c_str(), res.line);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(res.text.c_str());
+                }
+                ImGui::EndChild();
+            }
+        }
 
     } else if (current_tab == 1) {
-        // ── Tab 1: placeholder ────────────────────────────────────────────────
-        ImGui::SetWindowFontScale(1.5f);
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Tab 1");
+        ImGui::SetWindowFontScale(1.4f);
+        ImGui::TextColored(ImVec4(0.4f,0.9f,0.6f,1.0f), "Zaphkiel Dumpers");
         ImGui::SetWindowFontScale(1.0f);
+        ImGui::Separator();
+        ImGui::Spacing();
 
-    } else if (current_tab == 2) {
-        // ── Tab 2: placeholder ────────────────────────────────────────────────
-        ImGui::SetWindowFontScale(1.5f);
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Tab 2");
+        if (dlsym(RTLD_DEFAULT, "zaphkiel_draw_tab")) {
+            Zaphkiel::DrawTab();
+        } else {
+            ImGui::TextColored(ImVec4(1.0f,0.8f,0.2f,1.0f),
+                "Waiting for Zaphkiel to initialise...");
+            ImGui::Spacing();
+            FILE* f = fopen("/storage/emulated/0/games/kurumi/.progress", "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof(line), f))
+                    ImGui::TextUnformatted(line);
+                fclose(f);
+            } else {
+                ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.0f), "No progress data yet");
+            }
+        }
+
+    } else {
+        ImGui::SetWindowFontScale(1.4f);
+        ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.0f), "Settings");
         ImGui::SetWindowFontScale(1.0f);
-
-    } else if (current_tab == 3) {
-        // ── Tab 3: Zaphkiel ───────────────────────────────────────────────────
-        // Calls into Rust — renders progress bars, search, dumper controls.
-        // Defined in imgui_bridge.rs, exported as zaphkiel_draw_tab().
-        // Resolved at runtime via dlsym — zero link-time dependency.
-        static void (*zaphkiel_fn)() = nullptr;
-        if (!zaphkiel_fn)
-            zaphkiel_fn = (void(*)())dlsym(RTLD_DEFAULT, "zaphkiel_draw_tab");
-        if (zaphkiel_fn)
-            zaphkiel_fn();
-        else
-            ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Zaphkiel not loaded");
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.0f), "Add your settings here");
     }
 
     ImGui::EndChild();
     ImGui::End();
-    ImGui::PopStyleColor(); // WindowBg
-    ImGui::PopStyleVar(2);  // WindowPadding, WindowBorderSize
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
 
-    // update bounds for hit-test in touch callback
-    if (show_menu) {
+    {
         std::lock_guard<std::mutex> lock(g_boundsMutex);
-        g_menuBounds = { win_pos.x, win_pos.y, win_size.x, win_size.y, true };
-    } else {
-        std::lock_guard<std::mutex> lock(g_boundsMutex);
-        g_menuBounds.visible = false;
+        if (show_menu)
+            g_menuBounds = {win_pos.x, win_pos.y, win_size.x, win_size.y, true};
+        else
+            g_menuBounds.visible = false;
     }
 }
-
-// ── setup / render ────────────────────────────────────────────────────────────
 
 static void setup() {
     if (g_initialized || g_width <= 0) return;
     ImGui::CreateContext();
-    ImGuiIO& io  = ImGui::GetIO();
-    io.IniFilename      = nullptr;
-    io.FontGlobalScale  = 1.4f;
+    ImGuiIO& io        = ImGui::GetIO();
+    io.IniFilename     = nullptr;
+    io.FontGlobalScale = 1.4f;
     ImGui_ImplAndroid_Init();
     ImGui_ImplOpenGL3_Init("#version 300 es");
     g_initialized = true;
@@ -210,25 +267,23 @@ static void setup() {
 static void render() {
     if (!g_initialized) return;
 
-    // save GL state
-    GLint  last_active_texture; glGetIntegerv(GL_ACTIVE_TEXTURE,             &last_active_texture);
+    GLint last_active_texture; glGetIntegerv(GL_ACTIVE_TEXTURE, &last_active_texture);
     glActiveTexture(GL_TEXTURE0);
-    GLint  last_tex0;           glGetIntegerv(GL_TEXTURE_BINDING_2D,         &last_tex0);
+    GLint last_tex0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex0);
     glActiveTexture(GL_TEXTURE1);
-    GLint  last_tex1;           glGetIntegerv(GL_TEXTURE_BINDING_2D,         &last_tex1);
+    GLint last_tex1; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex1);
     glActiveTexture(last_active_texture);
-    GLint  last_prog;           glGetIntegerv(GL_CURRENT_PROGRAM,            &last_prog);
-    GLint  last_vbo;            glGetIntegerv(GL_ARRAY_BUFFER_BINDING,       &last_vbo);
-    GLint  last_ebo;            glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING,&last_ebo);
-    GLint  last_fbo;            glGetIntegerv(GL_FRAMEBUFFER_BINDING,        &last_fbo);
-    GLint  last_vp[4];          glGetIntegerv(GL_VIEWPORT,                   last_vp);
+    GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM,              &last_prog);
+    GLint last_vbo;  glGetIntegerv(GL_ARRAY_BUFFER_BINDING,         &last_vbo);
+    GLint last_ebo;  glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_ebo);
+    GLint last_fbo;  glGetIntegerv(GL_FRAMEBUFFER_BINDING,          &last_fbo);
+    GLint last_vp[4];glGetIntegerv(GL_VIEWPORT,                     last_vp);
     GLboolean last_scissor = glIsEnabled(GL_SCISSOR_TEST);
     GLboolean last_depth   = glIsEnabled(GL_DEPTH_TEST);
     GLboolean last_blend   = glIsEnabled(GL_BLEND);
 
-    // ImGui frame
-    ImGuiIO& io     = ImGui::GetIO();
-    io.DisplaySize  = ImVec2((float)g_width, (float)g_height);
+    ImGuiIO& io    = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)g_width, (float)g_height);
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
@@ -238,27 +293,21 @@ static void render() {
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    // restore GL state
     glUseProgram(last_prog);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, last_tex0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, last_tex1);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, last_tex0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, last_tex1);
     glActiveTexture(last_active_texture);
-    glBindBuffer(GL_ARRAY_BUFFER,              last_vbo);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,      last_ebo);
-    glBindFramebuffer(GL_FRAMEBUFFER,          last_fbo);
+    glBindBuffer(GL_ARRAY_BUFFER,          last_vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,  last_ebo);
+    glBindFramebuffer(GL_FRAMEBUFFER,      last_fbo);
     glViewport(last_vp[0], last_vp[1], last_vp[2], last_vp[3]);
     if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     if (last_depth)   glEnable(GL_DEPTH_TEST);   else glDisable(GL_DEPTH_TEST);
     if (last_blend)   glEnable(GL_BLEND);        else glDisable(GL_BLEND);
 }
 
-// ── eglSwapBuffers hook ───────────────────────────────────────────────────────
-
 static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     if (!orig_eglswapbuffers) return EGL_FALSE;
-
     EGLContext ctx = eglGetCurrentContext();
     if (ctx == EGL_NO_CONTEXT ||
         (g_targetcontext != EGL_NO_CONTEXT &&
@@ -270,20 +319,14 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
     if (w < 100 || h < 100) return orig_eglswapbuffers(dpy, surf);
 
-    if (g_targetcontext == EGL_NO_CONTEXT) {
-        g_targetcontext = ctx;
-        g_targetsurface = surf;
-    }
-    g_width  = w;
-    g_height = h;
+    if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
+    g_width = w; g_height = h;
 
     setup();
     render();
 
     return orig_eglswapbuffers(dpy, surf);
 }
-
-// ── touch callback ────────────────────────────────────────────────────────────
 
 typedef bool (*PreloaderInput_OnTouch_Fn)(int action, int pointerId, float x, float y);
 struct PreloaderInput_Interface {
@@ -301,25 +344,18 @@ bool OnTouchCallback(int action, int pointerId, float x, float y) {
     else if (action == AMOTION_EVENT_ACTION_UP)
         io.AddMouseButtonEvent(0, false);
 
-    // notify Zaphkiel bridge (no-op currently, hook point for future use)
-    static bool (*zaphkiel_touch)(int, float, float) = nullptr;
-    if (!zaphkiel_touch)
-        zaphkiel_touch = (bool(*)(int,float,float))dlsym(RTLD_DEFAULT, "zaphkiel_notify_touch");
-    if (zaphkiel_touch)
-        zaphkiel_touch(action, x, y);
+    Zaphkiel::NotifyTouch(action, x, y);
 
     bool hitTest = false;
     {
         std::lock_guard<std::mutex> lock(g_boundsMutex);
         if (g_menuBounds.visible &&
-            x >= g_menuBounds.x && x <= (g_menuBounds.x + g_menuBounds.w) &&
-            y >= g_menuBounds.y && y <= (g_menuBounds.y + g_menuBounds.h))
+            x >= g_menuBounds.x && x <= g_menuBounds.x + g_menuBounds.w &&
+            y >= g_menuBounds.y && y <= g_menuBounds.y + g_menuBounds.h)
             hitTest = true;
     }
     return hitTest || io.WantCaptureMouse;
 }
-
-// ── main thread + constructor ─────────────────────────────────────────────────
 
 static void* mainthread(void*) {
     sleep(3);
