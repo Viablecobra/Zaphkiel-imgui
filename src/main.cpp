@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <map>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -26,6 +27,87 @@ static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
 
+// ── software keyboard ─────────────────────────────────────────────────────────
+
+static JavaVM*        g_jvm      = nullptr;
+static jobject        g_activity = nullptr;
+static bool           g_keyboard_visible = false;
+
+static void keyboard_show() {
+    if (!g_jvm || !g_activity) return;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+        g_jvm->AttachCurrentThread(&env, nullptr);
+        attached = true;
+    }
+    if (!env) return;
+
+    jclass    activity_class  = env->GetObjectClass(g_activity);
+    jmethodID get_window      = env->GetMethodID(activity_class, "getWindow", "()Landroid/view/Window;");
+    jobject   window          = env->CallObjectMethod(g_activity, get_window);
+    jclass    window_class    = env->GetObjectClass(window);
+    jmethodID get_decor_view  = env->GetMethodID(window_class, "getDecorView", "()Landroid/view/View;");
+    jobject   decor_view      = env->CallObjectMethod(window, get_decor_view);
+
+    jclass    context_class   = env->FindClass("android/content/Context");
+    jfieldID  imm_field       = env->GetStaticFieldID(context_class, "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
+    jstring   imm_str         = (jstring)env->GetStaticObjectField(context_class, imm_field);
+
+    jmethodID get_system_svc  = env->GetMethodID(activity_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jobject   imm             = env->CallObjectMethod(g_activity, get_system_svc, imm_str);
+    jclass    imm_class       = env->GetObjectClass(imm);
+    jmethodID show_soft_input = env->GetMethodID(imm_class, "showSoftInput", "(Landroid/view/View;I)Z");
+    env->CallBooleanMethod(imm, show_soft_input, decor_view, 0);
+
+    env->DeleteLocalRef(activity_class); env->DeleteLocalRef(window);
+    env->DeleteLocalRef(window_class);   env->DeleteLocalRef(decor_view);
+    env->DeleteLocalRef(context_class);  env->DeleteLocalRef(imm_str);
+    env->DeleteLocalRef(imm);            env->DeleteLocalRef(imm_class);
+    if (attached) g_jvm->DetachCurrentThread();
+    g_keyboard_visible = true;
+}
+
+static void keyboard_hide() {
+    if (!g_jvm || !g_activity) return;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+        g_jvm->AttachCurrentThread(&env, nullptr);
+        attached = true;
+    }
+    if (!env) return;
+
+    jclass    activity_class   = env->GetObjectClass(g_activity);
+    jmethodID get_window       = env->GetMethodID(activity_class, "getWindow", "()Landroid/view/Window;");
+    jobject   window           = env->CallObjectMethod(g_activity, get_window);
+    jclass    window_class     = env->GetObjectClass(window);
+    jmethodID get_decor_view   = env->GetMethodID(window_class, "getDecorView", "()Landroid/view/View;");
+    jobject   decor_view       = env->CallObjectMethod(window, get_decor_view);
+
+    jclass    view_class       = env->GetObjectClass(decor_view);
+    jmethodID get_window_token = env->GetMethodID(view_class, "getWindowToken", "()Landroid/os/IBinder;");
+    jobject   binder           = env->CallObjectMethod(decor_view, get_window_token);
+
+    jclass    context_class    = env->FindClass("android/content/Context");
+    jfieldID  imm_field        = env->GetStaticFieldID(context_class, "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
+    jstring   imm_str          = (jstring)env->GetStaticObjectField(context_class, imm_field);
+
+    jmethodID get_system_svc   = env->GetMethodID(activity_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jobject   imm              = env->CallObjectMethod(g_activity, get_system_svc, imm_str);
+    jclass    imm_class        = env->GetObjectClass(imm);
+    jmethodID hide_soft_input  = env->GetMethodID(imm_class, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z");
+    env->CallBooleanMethod(imm, hide_soft_input, binder, 0);
+
+    env->DeleteLocalRef(activity_class); env->DeleteLocalRef(window);
+    env->DeleteLocalRef(window_class);   env->DeleteLocalRef(decor_view);
+    env->DeleteLocalRef(view_class);     env->DeleteLocalRef(binder);
+    env->DeleteLocalRef(context_class);  env->DeleteLocalRef(imm_str);
+    env->DeleteLocalRef(imm);            env->DeleteLocalRef(imm_class);
+    if (attached) g_jvm->DetachCurrentThread();
+    g_keyboard_visible = false;
+}
+
 struct WindowBounds { float x, y, w, h; bool visible; };
 static WindowBounds g_menuBounds = {0, 0, 0, 0, false};
 static std::mutex   g_boundsMutex;
@@ -39,31 +121,43 @@ static void do_search(const char* query) {
     std::vector<SearchResult> results;
     const char* files[] = {
         "functions.txt","imports.txt","exports.txt","vtables.txt",
-        "rtti.txt","names.txt","strings.txt","xrefs.txt",
-        "pseudo_c.txt","structs.txt","patterns.txt","relocs.txt",
+        "rtti.txt","names.txt","strings.txt","hexdump.txt",
+        "xrefs.txt","pseudo_c.txt","structs.txt","patterns.txt",
+        "relocs.txt","stats.txt",
     };
     std::string q = query;
     for (auto& c : q) c = tolower(c);
+
     for (auto& fname : files) {
         std::string path = std::string("/storage/emulated/0/games/kurumi/") + fname;
         FILE* f = fopen(path.c_str(), "r");
         if (!f) continue;
+
         char line[512];
         int lineno = 0;
+        int file_hits = 0;
+
         while (fgets(line, sizeof(line), f)) {
             lineno++;
             std::string l = line;
+            // strip trailing newline
+            if (!l.empty() && l.back() == '\n') l.pop_back();
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+
             std::string ll = l;
             for (auto& c : ll) c = tolower(c);
+
             if (ll.find(q) != std::string::npos) {
-                if (l.size() > 100) l.resize(100);
+                if (l.size() > 120) l.resize(120);
                 results.push_back({fname, lineno, l});
-                if (results.size() >= 200) { fclose(f); goto done; }
+                file_hits++;
+                // cap per-file at 500 so one huge file doesn't drown others
+                if (file_hits >= 500) break;
             }
         }
         fclose(f);
     }
-    done:
+
     std::lock_guard<std::mutex> lock(g_search_mutex);
     g_search_results = results;
 }
@@ -90,7 +184,10 @@ void drawmenu() {
     ImGui::SetWindowFontScale(1.0f);
     ImGui::End();
 
-    if (!show_menu) return;
+    if (!show_menu) {
+        if (g_keyboard_visible) keyboard_hide();
+        return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(1000, 650), ImGuiCond_Appearing);
     ImGui::SetNextWindowPos(
@@ -165,10 +262,18 @@ void drawmenu() {
         ImGui::Spacing();
 
         ImGui::SetNextItemWidth(500.0f);
+        bool was_active = ImGui::IsItemActive();
         bool enter = ImGui::InputText("##q", g_search_buf, sizeof(g_search_buf),
             ImGuiInputTextFlags_EnterReturnsTrue);
+        bool is_active = ImGui::IsItemActive();
+
+        // show keyboard when InputText gets focus, hide when it loses focus
+        if (!was_active && is_active)  keyboard_show();
+        if (was_active  && !is_active) keyboard_hide();
+
         ImGui::SameLine();
         bool btn = ImGui::Button("Search", ImVec2(120, 0));
+        if (btn) keyboard_hide();
 
         if ((enter || btn) && strlen(g_search_buf) >= 2) {
             std::string q = g_search_buf;
@@ -192,13 +297,32 @@ void drawmenu() {
                 ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.0f),
                     strlen(g_search_buf) < 2
                         ? "Type at least 2 characters and press Search"
-                        : "No results");
+                        : "No results found");
             } else {
-                ImGui::Text("%zu results:", g_search_results.size());
+                // count results per file
+                std::map<std::string, int> file_counts;
+                for (auto& res : g_search_results)
+                    file_counts[res.file]++;
+
+                ImGui::TextColored(ImVec4(0.4f,0.9f,0.6f,1.0f),
+                    "%zu results across %zu files:",
+                    g_search_results.size(), file_counts.size());
+                ImGui::Spacing();
+
                 ImGui::BeginChild("##results", ImVec2(0, 0), false);
+
+                std::string cur_file = "";
                 for (auto& res : g_search_results) {
-                    ImGui::TextColored(ImVec4(0.4f,0.7f,1.0f,1.0f),
-                        "[%s:%d]", res.file.c_str(), res.line);
+                    // file header when file changes
+                    if (res.file != cur_file) {
+                        if (!cur_file.empty()) ImGui::Spacing();
+                        ImGui::TextColored(ImVec4(1.0f,0.7f,0.2f,1.0f),
+                            "── %s (%d) ──", res.file.c_str(), file_counts[res.file]);
+                        ImGui::Separator();
+                        cur_file = res.file;
+                    }
+                    // line number
+                    ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.0f), "%5d", res.line);
                     ImGui::SameLine();
                     ImGui::TextUnformatted(res.text.c_str());
                 }
@@ -383,4 +507,24 @@ __attribute__((constructor))
 void display_init() {
     pthread_t t;
     pthread_create(&t, nullptr, mainthread, nullptr);
+}
+
+// Grab JavaVM when the .so is loaded — needed for software keyboard
+extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
+    g_jvm = vm;
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_VERSION_1_6;
+
+    // find the activity via ActivityThread
+    jclass    activity_thread  = env->FindClass("android/app/ActivityThread");
+    jmethodID current_at       = env->GetStaticMethodID(activity_thread, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    jobject   at               = env->CallStaticObjectMethod(activity_thread, current_at);
+    jmethodID get_application  = env->GetMethodID(activity_thread, "getApplication", "()Landroid/app/Application;");
+    jobject   app              = env->CallObjectMethod(at, get_application);
+    if (app) g_activity = env->NewGlobalRef(app);
+
+    env->DeleteLocalRef(activity_thread);
+    env->DeleteLocalRef(at);
+    if (app) env->DeleteLocalRef(app);
+    return JNI_VERSION_1_6;
 }
