@@ -15,7 +15,7 @@ jobs:
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
-          ndk-version: r25c # 이 부분을 r26b에서 r25c로 수정했습니다!
+          ndk-version: r25c
 
       - name: Build
         run: |
@@ -29,5 +29,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: libMotionBlur
-          path: build/libMotionBlur.so
+          name: libZaphkiel-imgui
+          path: build/libZaphkiel-imgui.so

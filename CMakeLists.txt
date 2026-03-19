@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
-project(MotionBlur LANGUAGES C CXX)
+
+project(Zaphkiel-imgui LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,7 +12,6 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--
 
 include(FetchContent)
 
-# 1. PreLoader 대신 Dobby 라이브러리를 가져옵니다.
 FetchContent_Declare(
     dobby
     GIT_REPOSITORY https://github.com/jmpews/Dobby.git
@@ -35,7 +35,6 @@ set(SOURCES
     src/ImGui/backends/imgui_impl_android.cpp
 )
 
-add_library(MotionBlur SHARED ${SOURCES})
+add_library(Zaphkiel-imgui SHARED ${SOURCES})
 
-# 2. preloader를 제거하고 dobby를 링크합니다.
-target_link_libraries(MotionBlur dobby log android EGL GLESv3 GLESv2)
+target_link_libraries(Zaphkiel-imgui dobby log android EGL GLESv3 GLESv2)
