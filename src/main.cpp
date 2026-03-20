@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <atomic>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -32,8 +33,13 @@ static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
 static JavaVM*        g_jvm      = nullptr;
 static jobject        g_activity = nullptr;
 static bool           g_keyboard_visible = false;
+static std::atomic<int> g_keyboard_request{0}; // 0=none 1=show 2=hide
 
-static void keyboard_show() {
+// Keyboard calls MUST NOT happen on the render thread — they touch Android UI
+// and will deadlock if called from the GL thread. Instead the render thread
+// sets a flag and a dedicated thread does the actual JNI call.
+
+static void keyboard_do_show() {
     if (!g_jvm || !g_activity) return;
     JNIEnv* env = nullptr;
     bool attached = false;
@@ -43,32 +49,30 @@ static void keyboard_show() {
     }
     if (!env) return;
 
-    jclass    activity_class  = env->GetObjectClass(g_activity);
-    jmethodID get_window      = env->GetMethodID(activity_class, "getWindow", "()Landroid/view/Window;");
-    jobject   window          = env->CallObjectMethod(g_activity, get_window);
-    jclass    window_class    = env->GetObjectClass(window);
-    jmethodID get_decor_view  = env->GetMethodID(window_class, "getDecorView", "()Landroid/view/View;");
-    jobject   decor_view      = env->CallObjectMethod(window, get_decor_view);
+    jclass    ac  = env->GetObjectClass(g_activity);
+    jmethodID gw  = env->GetMethodID(ac, "getWindow", "()Landroid/view/Window;");
+    jobject   win = env->CallObjectMethod(g_activity, gw);
+    jclass    wc  = env->GetObjectClass(win);
+    jmethodID gdv = env->GetMethodID(wc, "getDecorView", "()Landroid/view/View;");
+    jobject   dv  = env->CallObjectMethod(win, gdv);
 
-    jclass    context_class   = env->FindClass("android/content/Context");
-    jfieldID  imm_field       = env->GetStaticFieldID(context_class, "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
-    jstring   imm_str         = (jstring)env->GetStaticObjectField(context_class, imm_field);
+    jclass    cc   = env->FindClass("android/content/Context");
+    jfieldID  imf  = env->GetStaticFieldID(cc, "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
+    jstring   ims  = (jstring)env->GetStaticObjectField(cc, imf);
+    jmethodID gss  = env->GetMethodID(ac, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jobject   imm  = env->CallObjectMethod(g_activity, gss, ims);
+    jclass    ic   = env->GetObjectClass(imm);
+    jmethodID ssi  = env->GetMethodID(ic, "showSoftInput", "(Landroid/view/View;I)Z");
+    env->CallBooleanMethod(imm, ssi, dv, 0);
 
-    jmethodID get_system_svc  = env->GetMethodID(activity_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    jobject   imm             = env->CallObjectMethod(g_activity, get_system_svc, imm_str);
-    jclass    imm_class       = env->GetObjectClass(imm);
-    jmethodID show_soft_input = env->GetMethodID(imm_class, "showSoftInput", "(Landroid/view/View;I)Z");
-    env->CallBooleanMethod(imm, show_soft_input, decor_view, 0);
-
-    env->DeleteLocalRef(activity_class); env->DeleteLocalRef(window);
-    env->DeleteLocalRef(window_class);   env->DeleteLocalRef(decor_view);
-    env->DeleteLocalRef(context_class);  env->DeleteLocalRef(imm_str);
-    env->DeleteLocalRef(imm);            env->DeleteLocalRef(imm_class);
+    env->DeleteLocalRef(ac); env->DeleteLocalRef(win); env->DeleteLocalRef(wc);
+    env->DeleteLocalRef(dv); env->DeleteLocalRef(cc);  env->DeleteLocalRef(ims);
+    env->DeleteLocalRef(imm);env->DeleteLocalRef(ic);
     if (attached) g_jvm->DetachCurrentThread();
     g_keyboard_visible = true;
 }
 
-static void keyboard_hide() {
+static void keyboard_do_hide() {
     if (!g_jvm || !g_activity) return;
     JNIEnv* env = nullptr;
     bool attached = false;
@@ -78,34 +82,46 @@ static void keyboard_hide() {
     }
     if (!env) return;
 
-    jclass    activity_class   = env->GetObjectClass(g_activity);
-    jmethodID get_window       = env->GetMethodID(activity_class, "getWindow", "()Landroid/view/Window;");
-    jobject   window           = env->CallObjectMethod(g_activity, get_window);
-    jclass    window_class     = env->GetObjectClass(window);
-    jmethodID get_decor_view   = env->GetMethodID(window_class, "getDecorView", "()Landroid/view/View;");
-    jobject   decor_view       = env->CallObjectMethod(window, get_decor_view);
+    jclass    ac  = env->GetObjectClass(g_activity);
+    jmethodID gw  = env->GetMethodID(ac, "getWindow", "()Landroid/view/Window;");
+    jobject   win = env->CallObjectMethod(g_activity, gw);
+    jclass    wc  = env->GetObjectClass(win);
+    jmethodID gdv = env->GetMethodID(wc, "getDecorView", "()Landroid/view/View;");
+    jobject   dv  = env->CallObjectMethod(win, gdv);
+    jclass    vc  = env->GetObjectClass(dv);
+    jmethodID gwt = env->GetMethodID(vc, "getWindowToken", "()Landroid/os/IBinder;");
+    jobject   bnd = env->CallObjectMethod(dv, gwt);
 
-    jclass    view_class       = env->GetObjectClass(decor_view);
-    jmethodID get_window_token = env->GetMethodID(view_class, "getWindowToken", "()Landroid/os/IBinder;");
-    jobject   binder           = env->CallObjectMethod(decor_view, get_window_token);
+    jclass    cc   = env->FindClass("android/content/Context");
+    jfieldID  imf  = env->GetStaticFieldID(cc, "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
+    jstring   ims  = (jstring)env->GetStaticObjectField(cc, imf);
+    jmethodID gss  = env->GetMethodID(ac, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jobject   imm  = env->CallObjectMethod(g_activity, gss, ims);
+    jclass    ic   = env->GetObjectClass(imm);
+    jmethodID hsi  = env->GetMethodID(ic, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z");
+    env->CallBooleanMethod(imm, hsi, bnd, 0);
 
-    jclass    context_class    = env->FindClass("android/content/Context");
-    jfieldID  imm_field        = env->GetStaticFieldID(context_class, "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
-    jstring   imm_str          = (jstring)env->GetStaticObjectField(context_class, imm_field);
-
-    jmethodID get_system_svc   = env->GetMethodID(activity_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    jobject   imm              = env->CallObjectMethod(g_activity, get_system_svc, imm_str);
-    jclass    imm_class        = env->GetObjectClass(imm);
-    jmethodID hide_soft_input  = env->GetMethodID(imm_class, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z");
-    env->CallBooleanMethod(imm, hide_soft_input, binder, 0);
-
-    env->DeleteLocalRef(activity_class); env->DeleteLocalRef(window);
-    env->DeleteLocalRef(window_class);   env->DeleteLocalRef(decor_view);
-    env->DeleteLocalRef(view_class);     env->DeleteLocalRef(binder);
-    env->DeleteLocalRef(context_class);  env->DeleteLocalRef(imm_str);
-    env->DeleteLocalRef(imm);            env->DeleteLocalRef(imm_class);
+    env->DeleteLocalRef(ac); env->DeleteLocalRef(win); env->DeleteLocalRef(wc);
+    env->DeleteLocalRef(dv); env->DeleteLocalRef(vc);  env->DeleteLocalRef(bnd);
+    env->DeleteLocalRef(cc); env->DeleteLocalRef(ims); env->DeleteLocalRef(imm);
+    env->DeleteLocalRef(ic);
     if (attached) g_jvm->DetachCurrentThread();
     g_keyboard_visible = false;
+}
+
+// Called from render thread — just sets a flag, never blocks
+static void keyboard_show() { g_keyboard_request.store(1); }
+static void keyboard_hide() { g_keyboard_request.store(2); g_keyboard_visible = false; }
+
+// Background thread that drains the keyboard request flag
+static void* keyboard_thread(void*) {
+    while (true) {
+        int req = g_keyboard_request.exchange(0);
+        if (req == 1) keyboard_do_show();
+        else if (req == 2) keyboard_do_hide();
+        usleep(16000); // ~60fps poll
+    }
+    return nullptr;
 }
 
 struct WindowBounds { float x, y, w, h; bool visible; };
@@ -483,6 +499,11 @@ bool OnTouchCallback(int action, int pointerId, float x, float y) {
 
 static void* mainthread(void*) {
     sleep(3);
+
+    // start keyboard request handler on its own thread
+    pthread_t kbt;
+    pthread_create(&kbt, nullptr, keyboard_thread, nullptr);
+    pthread_detach(kbt);
     GlossInit(true);
     GHandle hegl = GlossOpen("libEGL.so");
     if (hegl) {
